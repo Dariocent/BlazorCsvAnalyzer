@@ -1,0 +1,155 @@
+﻿@page "/ipc-analysis"
+@using BlazorCsvAnalyzer.Data
+@using System.Globalization
+@using System.Text;
+
+
+
+<h3>IPC Analysis</h3>
+
+<p>This tool is developed using the .NET framework Blazor.</p>
+<p>It accepts in input a CSV file containing information about Industrial PCs (Name, avg/min/max value, CPUMhz)</p>
+<p>It returns a list of Industrial PCs that can be downsized based on their usage. This list can be downloaded as a text file.</p>
+
+
+<p>Please, input your CSV file containing data about the usage.</p>
+
+<InputFile OnChange="HandleFileSelected" accept=".csv" maxFileSize="100000000" />
+<br>
+
+@if (ProcessingComplete)
+{
+    @if (DownsizableIPCs != null && DownsizableIPCs.Any())
+    {
+        <p>List of downsizable IPCs:</p>
+        <p><a href="@DownsizableIPCsFileUrl" download="DownsizableIPCs.txt">Download List of Downsizable IPCs</a></p>
+        <ul>
+            @foreach (var record in DownsizableIPCs)
+            {
+                <li>@record</li>
+            }
+        </ul>
+    }
+    else
+    {
+        <p>No downsizable IPCs available.</p>
+    }
+}
+else
+{
+    <p>Upload a CSV file to begin processing.</p>
+}
+
+@code {
+    // Method to calculate percentile of a sequence
+    private static double Percentile(IEnumerable<double> seq, double percentile)
+    {
+        // Sort the sequence and convert it to an array
+        var elements = seq.OrderBy(x => x).ToArray();
+        // Calculate the index position for the percentile
+        var realIndex = percentile * (elements.Length - 1);
+        // Take the integer part of the index
+        var index = (int)realIndex;
+        // Calculate the fractional part of the index
+        var frac = realIndex - index;
+        // Linear interpolation between closest ranks
+        if (index + 1 < elements.Length)
+            return elements[index] * (1 - frac) + elements[index + 1] * frac;
+        return elements[index];
+    }
+
+    // Initialize list to hold IPC records
+    private List<IPCData> IPC_list = new List<IPCData>();
+    private List<string> DownsizableIPCs = new List<string>();
+    private bool ProcessingComplete = false;
+    private string DownsizableIPCsFileUrl = "";
+
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file != null)
+        {
+            using (var memoryStream = new MemoryStream())
+            {
+                await file.OpenReadStream(maxAllowedSize: 1024 * 100000).CopyToAsync(memoryStream);
+                memoryStream.Seek(0, SeekOrigin.Begin); // Reset the stream position
+                await LoadCsvData(memoryStream);
+                await ProcessData();
+            }
+        }
+    }
+
+    private async Task LoadCsvData(Stream fileStream)
+    {
+
+        // Open the CSV file for reading
+        using (var reader = new StreamReader(fileStream))
+        {
+            reader.ReadLine(); // Skip the header line
+
+            // Read file line-by-line
+            while (!reader.EndOfStream)
+            {
+                // Read current line
+                var line = reader.ReadLine();
+                // Split the line by semicolons
+                var values = line?.Split(';');
+                // Skip line if fewer than 8 fields
+                if (values.Length< 8) continue;
+
+                try
+                {
+                    // Skip line if CpuMHz contains a space
+                    if (values[7].Contains(' ')) continue;
+
+                    // Parse and add the record to the list
+                    IPC_list.Add(new IPCData
+                            {
+                                IPC = values[0],
+                                AvgValue = double.Parse(values[3].Replace(",", "."), CultureInfo.InvariantCulture),
+                                MaxValue = double.Parse(values[5].Replace(",", "."), CultureInfo.InvariantCulture),
+                                CpuMHz = double.Parse(values[7].Replace(",", "."), CultureInfo.InvariantCulture)
+                            });
+                }
+                catch (Exception)
+                {
+                    // Skip line if any parsing error occurs
+                }
+            }
+        }
+    }
+
+    private async Task ProcessData()
+    {
+        // Group records by IPC
+        var groupedRecords = IPC_list.GroupBy(r => r.IPC);
+        foreach (var group in groupedRecords)
+        {
+            // Calculate metrics
+            var usages = group.Select(r => r.AvgValue / r.CpuMHz * 100).ToArray();
+            var meanUsage = usages.Average();
+            var p95Usage = Percentile(usages, 0.95);
+            var stdDevUsage = Math.Sqrt(usages.Select(u => Math.Pow(u - meanUsage, 2)).Average());
+            var coefficientOfVariation = stdDevUsage / meanUsage;
+
+            // Determine if downsizing is possible
+            var canDownsize = meanUsage < 50 && p95Usage < 75 && coefficientOfVariation < 0.5;
+
+            // Add IPC to list of downsizable IPCs if downsizing is possible
+			if (canDownsize) DownsizableIPCs.Add(group.Key);
+        }
+        // sort DownsizeableIPCs
+        DownsizableIPCs.Sort();
+        ProcessingComplete = true;
+
+        // Generate a text file with the list of downsizable IPCs
+        var downsizableIpcsText = string.Join(Environment.NewLine, DownsizableIPCs);
+        var downsizableIpcsBytes = Encoding.UTF8.GetBytes(downsizableIpcsText);
+        var base64Data = Convert.ToBase64String(downsizableIpcsBytes);
+        DownsizableIPCsFileUrl = $"data:text/plain;charset=utf-8;base64,{base64Data}";
+
+        // Trigger a UI update
+        StateHasChanged();
+    }
+}
